@@ -122,19 +122,14 @@ function MappaLive() {
     if (draggingRef.current) return; // non sovrascrivere una posizione in corso di trascinamento
     try {
       const rows = await fetchTables();
-      const fixed = spreadOverlaps(rows, rooms);
-      setAllTables(fixed.tables);
-      // ripara le vecchie posizioni sovrapposte salvandole sul database
-      for (const t of fixed.moved) {
-        updateTable(t.id, { x: t.x, y: t.y }).catch(() => {});
-      }
+      setAllTables(rows);
     } catch (e: any) {
       console.error("Errore caricamento Tables:", e);
       setFlash("⚠️ Errore di sincronizzazione database");
     } finally {
       setIsLoading(false);
     }
-  }, [rooms]);
+  }, []);
 
 
 
@@ -330,17 +325,17 @@ function MappaLive() {
         return;
       }
       const span = Math.max(1, current.span ?? 1);
-      const roomTables = allTables.filter(
-        (t) => !isBarTab(t.label) && roomPrefixOf(t.label, rooms) === activeRoom.prefix,
-      );
-      const spot = findFreeCell(roomTables, span, { col, row }, current.id);
+      // niente più ricerca automatica di una cella libera vicina: con la griglia grande
+      // non serve, il tavolo va esattamente dove lo lasci (solo i bordi restano un limite)
+      const finalCol = Math.max(0, Math.min(COLS - span, col));
+      const finalRow = Math.max(0, Math.min(ROWS - 1, row));
 
       setAllTables((prev) =>
-        prev.map((t) => (String(t.id) === id ? { ...t, x: spot.col, y: spot.row } : t)),
+        prev.map((t) => (String(t.id) === id ? { ...t, x: finalCol, y: finalRow } : t)),
       );
 
       try {
-        await updateTable(id, { x: spot.col, y: spot.row });
+        await updateTable(id, { x: finalCol, y: finalRow });
       } catch (e: any) {
         console.error(e);
         setFlash("⚠️ Posizione non salvata");
@@ -349,7 +344,7 @@ function MappaLive() {
         draggingRef.current = false;
       }
     },
-    [allTables, rooms, activeRoom, findFreeCell, reload],
+    [allTables, reload],
   );
 
 
@@ -576,7 +571,7 @@ function MappaLive() {
           <div className="relative flex-1 overflow-hidden p-3 sm:p-5">
             <div
               ref={canvasRef}
-              className="relative h-full w-full select-none overflow-hidden rounded-3xl border border-cyan-500/20 bg-slate-950/40 shadow-[inset_0_0_80px_rgba(0,0,0,0.9)] backdrop-blur-md"
+              className="relative h-full w-full select-none overflow-auto overscroll-contain rounded-3xl border border-cyan-500/20 bg-slate-950/40 shadow-[inset_0_0_80px_rgba(0,0,0,0.9)] backdrop-blur-md"
             >
               <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_right,#06b6d408_1px,transparent_1px),linear-gradient(to_bottom,#06b6d408_1px,transparent_1px)] bg-[size:3rem_3rem]" />
 
@@ -595,7 +590,7 @@ function MappaLive() {
                   </p>
                 </div>
               ) : (
-                <div className="absolute inset-0 flex items-center justify-center overflow-hidden">
+                <div className="min-h-full w-full flex items-start justify-center p-4">
                   <div
                     className="relative"
                     style={{
@@ -780,50 +775,5 @@ function roomPrefixOf(label: string, rooms: PosRoom[]): string {
  * I tavoli non devono mai sovrapporsi: chi occupa una cella già presa viene
  * spostato nella prima cella libera della sua sala.
  */
-function spreadOverlaps(rows: PosTable[], rooms: PosRoom[]) {
-  const moved: PosTable[] = [];
-  const placed: PosTable[] = [];
-  const byRoom = new Map<string, PosTable[]>();
 
-  for (const t of rows) {
-    // i conti al banco non stanno sulla mappa: passano invariati, senza occupare celle
-    if (isBarTab(t.label)) {
-      placed.push(t);
-      continue;
-    }
-    const prefix = roomPrefixOf(t.label, rooms);
-    const list = byRoom.get(prefix) ?? [];
-    const span = Math.max(1, t.span ?? 1);
-    const clash = (col: number, row: number) =>
-      list.some((o) => {
-        const os = Math.max(1, o.span ?? 1);
-        return o.y === row && col < o.x + os && o.x < col + span;
-      });
-
-    let col = Math.max(0, Math.min(COLS - span, t.x));
-    let row = Math.max(0, Math.min(ROWS - 1, t.y));
-
-    if (clash(col, row) || col !== t.x || row !== t.y) {
-      let found = !clash(col, row);
-      for (let r = 0; !found && r < ROWS; r++) {
-        for (let c = 0; c <= COLS - span; c++) {
-          if (!clash(c, r)) {
-            col = c;
-            row = r;
-            found = true;
-            break;
-          }
-        }
-      }
-    }
-
-    const next = { ...t, x: col, y: row };
-    if (col !== t.x || row !== t.y) moved.push(next);
-    list.push(next);
-    byRoom.set(prefix, list);
-    placed.push(next);
-  }
-
-  return { tables: placed, moved };
-}
 
