@@ -50,9 +50,15 @@ function normalizeStatus(raw: unknown): TableStatus {
   return "free";
 }
 
-/** Griglia logica: le posizioni sono colonna/riga, non percentuali dello schermo. */
-export const GRID_COLS = 4;
-export const GRID_ROWS = 6;
+/**
+ * Griglia logica: le posizioni sono colonna/riga, non percentuali dello schermo.
+ * IMPORTANTE: deve restare identica a COLS/ROWS in TableCard.tsx. Se questi due
+ * valori divergono, ogni posizione con colonna/riga oltre il vecchio limite viene
+ * scambiata per una "percentuale legacy" e riportata quasi a zero al primo reload
+ * (è esattamente il bug per cui i tavoli tornavano vicino alla prima cella).
+ */
+export const GRID_COLS = 8;
+export const GRID_ROWS = 12;
 
 export function gridPosition(index: number) {
   return { x: index % GRID_COLS, y: Math.floor(index / GRID_COLS) % GRID_ROWS };
