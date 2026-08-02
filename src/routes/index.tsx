@@ -1,104 +1,97 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { Beer } from "lucide-react";
 import { TopNav } from "@/components/top-nav";
 import { RoomSelector } from "@/futures/live-map/components/roomselector";
-import { MapEditBar } from "@/futures/live-map/components/MapEditBar";
-import {
-  TableCard,
-  cellSize,
-  COLS,
-  ROWS,
-} from "@/futures/live-map/components/TableCard";
-
 import { TableModal } from "@/futures/live-map/components/TableModal";
 import { OrderManager } from "@/futures/live-map/components/OrderManager";
-import { ReservationsSidebar } from "@/futures/live-map/components/ReservationsSidebar";
+import { TableListMobile } from "@/futures/live-map/components/TableListMobile";
 import { BarCounterPanel } from "@/futures/live-map/components/BarCounter";
 import { isBarTab, openBarTab, closeBarTab } from "@/lib/bar-counter";
 import type { Reservation } from "@/lib/reservations-api";
-import {
-  fetchReservations,
-  createReservation,
-  assignReservationToTable,
-  completeReservation,
-} from "@/lib/reservations-api";
+import { fetchReservations, completeReservation } from "@/lib/reservations-api";
 import { supabase } from "@/lib/supabase";
 import { updateTableStatusInSupabase } from "@/lib/supabase-service";
-import {
-  createTable,
-  deleteTables as deleteTablesApi,
-  fetchTables,
-  gridPosition,
-  updateTable,
-  writeSpan,
-  type PosTable,
-} from "@/lib/tables-api";
-import { loadRooms, makePrefix, saveRooms, type PosRoom } from "@/lib/rooms-store";
+import { fetchAllOpenOrderItems, summarizeTableCourses, type OrderItemRow } from "@/lib/order-items-api";
+import { fetchAlertThreshold, DEFAULT_ALERT_THRESHOLD_MINUTES } from "@/lib/alert-settings-api";
+import { fetchTables, type PosTable } from "@/lib/tables-api";
+import { loadRooms, type PosRoom } from "@/lib/rooms-store";
+import { QrLoginScreen } from "@/futures/live-map/components/QrLoginScreen";
+import { loadSession, clearSession, type EmployeeSession } from "@/lib/employee-session";
 
+/**
+ * App Cameriere: pensata solo per telefono, sempre a mappa lineare (mai il canvas
+ * spaziale del gestionale). Rispetto al gestionale principale, qui NON si modifica
+ * la mappa (niente aggiungi/unisci/dividi/sposta tavoli, niente cambio posti): quello
+ * resta un compito da gestionale. Da qui il cameriere può solo:
+ * - aprire un tavolo per controllare/gestire l'ordine (aggiungere piatti, invio comanda/preconto, chiudi e paga)
+ * - controllare e gestire i corsi (segnare i piatti serviti)
+ * - spostare/unire l'ordine su un altro tavolo se ha aperto quello sbagliato
+ * Tutto sincronizzato in tempo reale con le stesse tabelle Supabase del gestionale madre.
+ */
 export const Route = createFileRoute("/")({
-  component: MappaLive,
+  component: AppGate,
   head: () => ({
     meta: [
-      { title: "Mappa Live -- Gestione Sale e Tavoli" },
+      { title: "App Cameriere -- Sala" },
       {
         name: "description",
-        content:
-          "Mappa live del ristorante: stato tavoli in tempo reale, gestione sale, unione e divisione dei tavoli.",
+        content: "App cameriere: stato tavoli, gestione ordini e corsi in tempo reale, sincronizzata col gestionale.",
       },
-      { property: "og:title", content: "Mappa Live -- Gestione Sale e Tavoli" },
-      {
-        property: "og:description",
-        content: "Stato tavoli in tempo reale, gestione sale e comande dal palmare.",
-      },
-      { property: "og:type", content: "website" },
-      { name: "twitter:card", content: "summary_large_image" },
     ],
   }),
 });
 
-function MappaLive() {
-  const [rooms, setRooms] = useState<PosRoom[]>(loadRooms);
+/** Cancello d'accesso: senza una sessione dipendente valida si vede solo la schermata di scansione QR. */
+function AppGate() {
+  const [session, setSession] = useState<EmployeeSession | null>(() => loadSession());
+
+  if (!session) {
+    return <QrLoginScreen onLoggedIn={setSession} />;
+  }
+
+  return (
+    <MappaCameriere
+      session={session}
+      onLogout={() => {
+        clearSession();
+        setSession(null);
+      }}
+    />
+  );
+}
+
+function MappaCameriere({ session, onLogout }: { session: EmployeeSession; onLogout: () => void }) {
+  const [rooms] = useState<PosRoom[]>(loadRooms);
   const [activeRoomId, setActiveRoomId] = useState<string>(() => loadRooms()[0].id);
   const [allTables, setAllTables] = useState<PosTable[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
-  const [selectedId, setSelectedId] = useState<string>("");
   const [activeOrderTable, setActiveOrderTable] = useState<{
     id: string;
     label: string;
+    seats?: number;
     reservation?: { clientName: string; covers: number; time: string; notes?: string } | null;
   } | null>(null);
-  const [editMode, setEditMode] = useState(false);
-  const [multiSel, setMultiSel] = useState<string[]>([]);
+  const [selectedId, setSelectedId] = useState<string>("");
   const [flash, setFlash] = useState("");
 
-  // Stato prenotazioni: caricato e sincronizzato da Supabase (tabella reservations)
+  // Prenotazioni: solo lettura, servono per il popup "conferma arrivo cliente" quando si
+  // apre un tavolo già prenotato. L'assegnazione di nuove prenotazioni resta nel gestionale.
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [pendingArrival, setPendingArrival] = useState<{
     table: PosTable;
     reservation: Reservation;
   } | null>(null);
 
-  const [selectedReservationId, setSelectedReservationId] = useState<string | null>(null);
   const [showBarPanel, setShowBarPanel] = useState(false);
   const [creatingBarTab, setCreatingBarTab] = useState(false);
-  const canvasRef = useRef<HTMLDivElement>(null);
-  const draggingRef = useRef(false);
-  // lato del tavolo (quadrato) calcolato sul canvas: la mappa entra sempre nel viewport
-  const [cell, setCell] = useState(84);
 
-  useEffect(() => {
-    const el = canvasRef.current;
-    if (!el) return;
-    const measure = () => setCell(cellSize(el.clientWidth, el.clientHeight));
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [isLoading]);
-
-
+  // Stato sintetico portate: righe order_items (solo Cucina) di tutti i tavoli, per calcolare
+  // in automatico "in preparazione" / "in attesa" e l'alert visivo di attesa troppo lunga.
+  const [orderItemsAll, setOrderItemsAll] = useState<OrderItemRow[]>([]);
+  const [alertThresholdMinutes, setAlertThresholdMinutes] = useState<number>(DEFAULT_ALERT_THRESHOLD_MINUTES);
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
   const activeRoom = useMemo(
     () => rooms.find((r) => r.id === activeRoomId) || rooms[0],
@@ -106,20 +99,16 @@ function MappaLive() {
   );
 
   const tables = useMemo(
-    () =>
-      allTables.filter(
-        (t) => !isBarTab(t.label) && roomPrefixOf(t.label, rooms) === activeRoom.prefix,
-      ),
+    () => allTables.filter((t) => !isBarTab(t.label) && roomPrefixOf(t.label, rooms) === activeRoom.prefix),
     [allTables, rooms, activeRoom],
   );
 
-  /** Conti aperti al bancone: non occupano celle sulla mappa dei tavoli. */
+  /** Conti aperti al bancone: mostrati a parte, non nell'elenco tavoli. */
   const barTabs = useMemo(() => allTables.filter((t) => isBarTab(t.label)), [allTables]);
 
-  /* ---------------- Supabase: fetch + realtime ---------------- */
+  /* ---------------- Supabase: fetch + realtime (stessa base dati del gestionale) ---------------- */
 
   const reload = useCallback(async () => {
-    if (draggingRef.current) return; // non sovrascrivere una posizione in corso di trascinamento
     try {
       const rows = await fetchTables();
       setAllTables(rows);
@@ -130,8 +119,6 @@ function MappaLive() {
       setIsLoading(false);
     }
   }, []);
-
-
 
   useEffect(() => {
     reload();
@@ -172,49 +159,56 @@ function MappaLive() {
     return () => window.clearTimeout(t);
   }, [flash]);
 
-  /* ---------------- Click-outside globale ---------------- */
+  /* ---------------- Stato sintetico portate: order_items + soglia alert ---------------- */
 
-  useEffect(() => {
-    const handler = (e: PointerEvent) => {
-      const el = e.target as HTMLElement | null;
-      if (el?.closest("[data-keep-open]")) return;
-      setSelectedId("");
-      setMultiSel([]);
-    };
-    document.addEventListener("pointerdown", handler);
-    return () => document.removeEventListener("pointerdown", handler);
+  const reloadOrderItems = useCallback(async () => {
+    try {
+      const rows = await fetchAllOpenOrderItems();
+      setOrderItemsAll(rows);
+    } catch (e) {
+      console.error("Errore caricamento stato portate:", e);
+    }
   }, []);
 
-  /* ---------------- Azioni tavoli e prenotazioni ---------------- */
+  useEffect(() => {
+    reloadOrderItems();
+    fetchAlertThreshold().then(setAlertThresholdMinutes);
+    const channel = supabase
+      .channel("public:order_items")
+      .on("postgres_changes", { event: "*", schema: "public", table: "order_items" }, () => reloadOrderItems())
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [reloadOrderItems]);
+
+  // Tick periodico: l'alert dipende dal tempo trascorso, non solo dai dati, quindi va
+  // ricalcolato anche senza nuovi eventi Supabase.
+  useEffect(() => {
+    const t = window.setInterval(() => setNowTick(Date.now()), 15000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  /** Stato sintetico + eventuale alert per un tavolo, calcolato dai piatti Cucina non ancora chiusi. */
+  const tableCourseInfo = useCallback(
+    (tableId: string) => {
+      const summary = summarizeTableCourses(orderItemsAll, tableId);
+      let alert = false;
+      if (summary.oldestPendingAt) {
+        const elapsedMin = (nowTick - new Date(summary.oldestPendingAt).getTime()) / 60000;
+        alert = elapsedMin >= alertThresholdMinutes;
+      }
+      const statusOverride =
+        summary.synthetic === "in_preparazione" ? "preparing" : summary.synthetic === "in_attesa" ? "ready" : undefined;
+      return { statusOverride: statusOverride as PosTable["status"] | undefined, alert };
+    },
+    [orderItemsAll, nowTick, alertThresholdMinutes],
+  );
+
+  /* ---------------- Apertura tavolo / prenotazione / banco ---------------- */
 
   const handleTap = useCallback(
-    async (id: string) => {
-      if (editMode) {
-        setMultiSel((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-        return;
-      }
-
-      if (selectedReservationId) {
-        const targetTable = allTables.find((t) => t.id === id);
-        const targetRes = reservations.find((r) => r.id === selectedReservationId);
-
-        if (targetTable && targetRes) {
-          try {
-            await assignReservationToTable(targetRes.id, targetTable.label);
-            // Il tavolo brilla di ciano finché la prenotazione resta assegnata
-            await updateTableStatusInSupabase(targetTable.id, "reserved");
-            await reloadReservations();
-            reload();
-            setFlash(`✨ Prenotazione di ${targetRes.clientName} assegnata al Tavolo ${targetTable.label}`);
-          } catch (e) {
-            console.error("Errore assegnazione prenotazione:", e);
-            setFlash("⚠️ Assegnazione prenotazione non riuscita");
-          }
-          setSelectedReservationId(null);
-          return;
-        }
-      }
-
+    (id: string) => {
       const targetTable = allTables.find((t) => t.id === id);
       if (!targetTable) return;
 
@@ -227,10 +221,9 @@ function MappaLive() {
         return;
       }
 
-      // APERTURA DIRETTA ORDINI: Tocchi il tavolo -> Si apre subito il gestore ordini
-      setActiveOrderTable({ id: String(targetTable.id), label: targetTable.label });
+      setSelectedId(id);
     },
-    [editMode, selectedReservationId, allTables, reservations, reload, reloadReservations]
+    [allTables, reservations],
   );
 
   /** Conferma l'arrivo del cliente: la prenotazione si chiude e si passa alla comanda. */
@@ -249,6 +242,7 @@ function MappaLive() {
     setActiveOrderTable({
       id: String(table.id),
       label: table.label,
+      seats: table.seats,
       reservation: {
         clientName: reservation.clientName,
         covers: reservation.covers,
@@ -266,7 +260,7 @@ function MappaLive() {
       const created = await openBarTab(allTables);
       setAllTables((prev) => [...prev, created]);
       setShowBarPanel(false);
-      setActiveOrderTable({ id: String(created.id), label: created.label });
+      setActiveOrderTable({ id: String(created.id), label: created.label, seats: created.seats });
     } catch (e: any) {
       console.error("Errore apertura conto al banco:", e);
       setFlash(`⚠️ ${e?.message || "Impossibile aprire il conto al banco"}`);
@@ -291,381 +285,63 @@ function MappaLive() {
     [allTables, reload],
   );
 
-  /** Prima cella libera (evita sovrapposizioni), a partire da una preferita. */
-  const findFreeCell = useCallback(
-    (list: PosTable[], span = 1, prefer?: { col: number; row: number }, ignoreId?: string) => {
-      const taken = (col: number, row: number) =>
-        list.some((t) => {
-          if (ignoreId && t.id === ignoreId) return false;
-          const ts = Math.max(1, t.span ?? 1);
-          return t.y === row && col < t.x + ts && t.x < col + span;
-        });
-      if (prefer) {
-        const c = Math.max(0, Math.min(COLS - span, prefer.col));
-        const r = Math.max(0, Math.min(ROWS - 1, prefer.row));
-        if (!taken(c, r)) return { col: c, row: r };
-      }
-      for (let row = 0; row < ROWS; row++) {
-        for (let col = 0; col <= COLS - span; col++) {
-          if (!taken(col, row)) return { col, row };
-        }
-      }
-      return { col: 0, row: 0 };
-    },
-    [],
-  );
-
-  /** Rilascio del tavolo: la posizione è già snappata alla griglia dal TableCard. */
-  const handleMove = useCallback(
-    async (id: string, col: number, row: number) => {
-      draggingRef.current = true;
-      const current = allTables.find((t) => String(t.id) === id);
-      if (!current) {
-        draggingRef.current = false;
-        return;
-      }
-      const span = Math.max(1, current.span ?? 1);
-      // niente più ricerca automatica di una cella libera vicina: con la griglia grande
-      // non serve, il tavolo va esattamente dove lo lasci (solo i bordi restano un limite)
-      const finalCol = Math.max(0, Math.min(COLS - span, col));
-      const finalRow = Math.max(0, Math.min(ROWS - 1, row));
-
-      setAllTables((prev) =>
-        prev.map((t) => (String(t.id) === id ? { ...t, x: finalCol, y: finalRow } : t)),
-      );
-
-      try {
-        await updateTable(id, { x: finalCol, y: finalRow });
-      } catch (e: any) {
-        console.error(e);
-        setFlash("⚠️ Posizione non salvata");
-        reload();
-      } finally {
-        draggingRef.current = false;
-      }
-    },
-    [allTables, reload],
-  );
-
-
-  const handleRenameTable = useCallback(async (id: string, label: string) => {
-    setAllTables((prev) => prev.map((t) => (t.id === id ? { ...t, label } : t)));
-    try {
-      await updateTable(id, { label });
-      setFlash(`✏️ Rinominato in ${label}`);
-    } catch (e: any) {
-      setFlash("⚠️ Rinomina non salvata");
-      reload();
-    }
-  }, [reload]);
-
-  const handleSeatsChange = useCallback(async (id: string, seats: number) => {
-    setAllTables((prev) => prev.map((t) => (t.id === id ? { ...t, seats } : t)));
-    try {
-      await updateTable(id, { seats });
-      setFlash(`👥 ${seats} posti`);
-    } catch {
-      setFlash("⚠️ Coperti non salvati");
-      reload();
-    }
-  }, [reload]);
-
-
-  const nextLabel = useCallback(() => {
-    const prefix = activeRoom.prefix;
-    const used = tables
-      .map((t) => Number(t.label.replace(prefix, "")))
-      .filter((n) => Number.isFinite(n));
-    let n = 1;
-    while (used.includes(n)) n++;
-    return `${prefix}${n}`;
-  }, [tables, activeRoom]);
-
-  const handleAddTable = async () => {
-    try {
-      const spot = findFreeCell(tables, 1);
-      const created = await createTable(nextLabel(), 0);
-      created.x = spot.col;
-      created.y = spot.row;
-      setAllTables((prev) => [...prev, created]);
-      await updateTable(created.id, { x: spot.col, y: spot.row });
-      setFlash(`✨ Tavolo ${created.label} creato`);
-    } catch (e: any) {
-      console.error(e);
-      setFlash(`⚠️ ${e?.message || "Errore durante la creazione"}`);
-    }
-  };
-
-
-  const handleDeleteTables = async () => {
-    if (!multiSel.length) return;
-    const ids = [...multiSel];
-    setAllTables((prev) => prev.filter((t) => !ids.includes(t.id)));
-    setMultiSel([]);
-    try {
-      await deleteTablesApi(ids);
-      setFlash("🗑️ Tavoli rimossi");
-    } catch (e: any) {
-      setFlash(`⚠️ ${e?.message || "Errore eliminazione"}`);
-      reload();
-    }
-  };
-
-  const handleMergeTables = async () => {
-    if (multiSel.length < 2) return;
-    const selected = tables.filter((t) => multiSel.includes(t.id));
-    const keep = selected.reduce((a, b) => (labelNum(a.label) <= labelNum(b.label) ? a : b));
-    const drop = selected.filter((t) => t.id !== keep.id);
-    const span = Math.min(COLS, selected.reduce((sum, t) => sum + t.span, 0));
-    // il blocco unito è più largo: lo riporto dentro i bordi della griglia
-    const col = Math.max(0, Math.min(COLS - span, keep.x));
-    writeSpan(keep.id, span);
-    setAllTables((prev) =>
-      prev
-        .filter((t) => !drop.some((d) => d.id === t.id))
-        .map((t) => (t.id === keep.id ? { ...t, span, x: col } : t)),
-    );
-    setMultiSel([]);
-    try {
-      await deleteTablesApi(drop.map((t) => t.id));
-      if (col !== keep.x) await updateTable(keep.id, { x: col });
-      setFlash(`🔗 Tavoli uniti in ${keep.label}`);
-    } catch {
-      reload();
-    }
-  };
-
-
-  const handleSplitTable = async () => {
-    const target = tables.find((t) => multiSel.includes(t.id) && t.span > 1);
-    if (!target) return;
-    const extra = target.span - 1;
-    writeSpan(target.id, 1);
-    const remaining = tables.map((t) => (t.id === target.id ? { ...t, span: 1 } : t));
-    setAllTables((prev) => prev.map((t) => (t.id === target.id ? { ...t, span: 1 } : t)));
-    setMultiSel([]);
-
-    try {
-      const prefix = activeRoom.prefix;
-      const used = new Set(remaining.map((t) => labelNum(t.label)));
-      const occupied = [...remaining];
-      for (let i = 0; i < extra; i++) {
-        let n = 1;
-        while (used.has(n)) n++;
-        used.add(n);
-        const created = await createTable(`${prefix}${n}`, 0);
-        // i pezzi separati si posizionano accanto al tavolo di partenza
-        const spot = findFreeCell(occupied, 1, { col: target.x + i + 1, row: target.y });
-        created.x = spot.col;
-        created.y = spot.row;
-        occupied.push(created);
-        await updateTable(created.id, { x: spot.col, y: spot.row });
-      }
-      setFlash(`✂️ ${target.label} diviso`);
-
-      reload();
-    } catch (e: any) {
-      setFlash(`⚠️ ${e?.message || "Errore divisione"}`);
-      reload();
-    }
-  };
-
-
-
-  const handleAddRoom = (name: string) => {
-    const room: PosRoom = { id: String(Date.now()), name, prefix: makePrefix(name, rooms) };
-    const next = [...rooms, room];
-    setRooms(next);
-    saveRooms(next);
-    setActiveRoomId(room.id);
-    setFlash(`🏛️ Sala "${name}" aggiunta`);
-  };
-
   const selectedTable = useMemo(
     () => allTables.find((t) => t.id === selectedId) || null,
     [allTables, selectedId],
   );
 
-  const canSplit = tables.some((t) => multiSel.includes(t.id) && t.span > 1);
-
-  const singleSelected = useMemo(() => {
-    if (multiSel.length !== 1) return null;
-    const t = tables.find((x) => x.id === multiSel[0]);
-    return t ? { id: t.id, label: t.label, seats: t.seats ?? 4 } : null;
-  }, [multiSel, tables]);
-
-
   return (
     <div className="flex h-screen min-h-screen w-full flex-col overflow-hidden bg-[#030712] text-slate-100 font-sans">
-      <TopNav active="Mappa Live" />
+      <TopNav active="Mappa Live" employeeName={session.name} onLogout={onLogout} />
 
-      {/* Main a due colonne */}
-      <main className="relative flex flex-1 flex-row overflow-hidden bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-[#030712] to-black">
-        
-        {/* Colonna Sinistra: Mappa e Tavoli */}
-        <div className="flex flex-1 flex-col overflow-hidden relative">
-          <div
-            data-keep-open
-            className="flex items-center justify-between gap-3 border-b border-cyan-500/15 bg-slate-950/70 px-4 py-2.5 backdrop-blur-xl"
+      <main className="relative flex flex-1 flex-col overflow-hidden bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-[#030712] to-black">
+        <div
+          data-keep-open
+          className="flex items-center justify-between gap-3 border-b border-cyan-500/15 bg-slate-950/70 px-3 py-2.5 backdrop-blur-xl"
+        >
+          <RoomSelector rooms={rooms} activeRoomId={activeRoom.id} onRoomChange={setActiveRoomId} onAddRoom={() => {}} />
+
+          <button
+            onClick={() => setShowBarPanel(true)}
+            className={`relative inline-flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-bold transition-all ${
+              barTabs.some((t) => t.status === "ready")
+                ? "border-purple-400 bg-purple-500/20 text-purple-300 shadow-[0_0_20px_rgba(168,85,247,0.5)] animate-pulse"
+                : barTabs.length > 0
+                  ? "border-amber-400 bg-amber-500/20 text-amber-300 shadow-[0_0_20px_rgba(245,158,11,0.4)]"
+                  : "border-amber-500/30 bg-amber-950/30 text-amber-400 hover:bg-amber-500/10 hover:border-amber-400"
+            }`}
           >
-            <RoomSelector
-              rooms={rooms}
-              activeRoomId={activeRoom.id}
-              onRoomChange={setActiveRoomId}
-              onAddRoom={handleAddRoom}
-            />
-
-            <div className="flex shrink-0 items-center gap-2">
-              <button
-                onClick={() => setShowBarPanel(true)}
-                className={`relative inline-flex shrink-0 items-center gap-2 rounded-xl border px-4 py-2 text-xs font-bold transition-all ${
-                  barTabs.some((t) => t.status === "ready")
-                    ? "border-purple-400 bg-purple-500/20 text-purple-300 shadow-[0_0_20px_rgba(168,85,247,0.5)] animate-pulse"
-                    : barTabs.length > 0
-                      ? "border-amber-400 bg-amber-500/20 text-amber-300 shadow-[0_0_20px_rgba(245,158,11,0.4)]"
-                      : "border-amber-500/30 bg-amber-950/30 text-amber-400 hover:bg-amber-500/10 hover:border-amber-400"
+            <Beer className="h-4 w-4" />
+            Banco
+            {barTabs.length > 0 && (
+              <span
+                className={`flex h-5 min-w-[20px] items-center justify-center rounded-full px-1.5 text-[10px] font-black text-slate-950 ${
+                  barTabs.some((t) => t.status === "ready") ? "bg-purple-400" : "bg-amber-500"
                 }`}
               >
-                <Beer className="h-4 w-4" />
-                Banco
-                {barTabs.length > 0 && (
-                  <span
-                    className={`flex h-5 min-w-[20px] items-center justify-center rounded-full px-1.5 text-[10px] font-black text-slate-950 ${
-                      barTabs.some((t) => t.status === "ready") ? "bg-purple-400" : "bg-amber-500"
-                    }`}
-                  >
-                    {barTabs.length}
-                  </span>
-                )}
-              </button>
+                {barTabs.length}
+              </span>
+            )}
+          </button>
+        </div>
 
-              <button
-                onClick={() => {
-                  setEditMode((v) => !v);
-                  setMultiSel([]);
-                }}
-                className={`inline-flex shrink-0 items-center gap-2 rounded-xl border px-4 py-2 text-xs font-bold transition-all ${
-                  editMode
-                    ? "border-cyan-400 bg-cyan-500/20 text-cyan-300 shadow-[0_0_20px_rgba(6,182,212,0.5)]"
-                    : "border-cyan-500/30 bg-cyan-950/30 text-cyan-400 hover:bg-cyan-500/10 hover:border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.2)]"
-                }`}
-              >
-                Riposiziona tavoli
-              </button>
-            </div>
-          </div>
-
-          {selectedReservationId && (
-            <div className="bg-cyan-500/20 border-b border-cyan-500/40 px-4 py-2 text-center text-xs font-bold text-cyan-300 animate-pulse flex items-center justify-center gap-2">
-              <span>💡 Tocca un tavolo sulla mappa per assegnare la prenotazione selezionata</span>
-              <button 
-                onClick={() => setSelectedReservationId(null)}
-                className="ml-4 bg-black/40 hover:bg-black/70 px-2 py-0.5 rounded text-[10px] text-white border border-cyan-500/30"
-              >
-                Annulla
-              </button>
-            </div>
-          )}
-
-          {/* Canvas */}
-          <div className="relative flex-1 overflow-hidden p-3 sm:p-5">
-            <div
-              ref={canvasRef}
-              className="relative h-full w-full select-none overflow-auto overscroll-contain rounded-3xl border border-cyan-500/20 bg-slate-950/40 shadow-[inset_0_0_80px_rgba(0,0,0,0.9)] backdrop-blur-md"
-            >
-              <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_right,#06b6d408_1px,transparent_1px),linear-gradient(to_bottom,#06b6d408_1px,transparent_1px)] bg-[size:3rem_3rem]" />
-
-              {isLoading ? (
-                <div className="flex h-full w-full flex-col items-center justify-center gap-3">
-                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-cyan-500 border-t-transparent shadow-[0_0_15px_rgba(6,182,212,0.6)]" />
-                  <span className="text-[11px] uppercase tracking-wider text-cyan-400/80">
-                    Sincronizzazione…
-                  </span>
-                </div>
-              ) : tables.length === 0 ? (
-                <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-center">
-                  <p className="text-xs font-semibold text-slate-300">Nessun tavolo in questa sala</p>
-                  <p className="text-[11px] text-slate-500">
-                    Attiva "Riposiziona tavoli" e premi Aggiungi per creare il primo tavolo.
-                  </p>
-                </div>
-              ) : (
-                <div className="min-h-full w-full flex items-start justify-center p-4">
-                  <div
-                    className="relative"
-                    style={{
-                      width: COLS * cell,
-                      height: ROWS * cell,
-                      backgroundImage: editMode
-                        ? "linear-gradient(to right,#06b6d41f 1px,transparent 1px),linear-gradient(to bottom,#06b6d41f 1px,transparent 1px)"
-                        : undefined,
-                      backgroundSize: `${cell}px ${cell}px`,
-                    }}
-                  >
-                    {tables.map((t) => (
-                      <TableCard
-                        key={t.id}
-                        table={t}
-                        cell={cell}
-                        onTap={handleTap}
-                        onMove={handleMove}
-                        isMultiSelected={multiSel.includes(t.id)}
-                        editMode={editMode}
-                      />
-                    ))}
-                  </div>
-                </div>
-
-
-              )}
-            </div>
-
-            {editMode && (
-              <div className="pointer-events-none absolute inset-x-0 bottom-4 z-30 flex justify-center px-3">
-                <MapEditBar
-                  selectedCount={multiSel.length}
-                  canSplit={canSplit}
-                  single={singleSelected}
-                  onAddTable={handleAddTable}
-                  onDeleteTables={handleDeleteTables}
-                  onMergeTables={handleMergeTables}
-                  onSplitTable={handleSplitTable}
-                  onRename={handleRenameTable}
-                  onSeats={handleSeatsChange}
-
-                  onDone={() => {
-                    setEditMode(false);
-                    setMultiSel([]);
-                  }}
-                />
+        <div className="relative flex-1 overflow-hidden p-2.5">
+          <div className="relative h-full w-full rounded-3xl border border-cyan-500/20 bg-slate-950/40 shadow-[inset_0_0_80px_rgba(0,0,0,0.9)] backdrop-blur-md">
+            {isLoading ? (
+              <div className="flex h-full w-full flex-col items-center justify-center gap-3">
+                <div className="h-10 w-10 animate-spin rounded-full border-2 border-cyan-500 border-t-transparent shadow-[0_0_15px_rgba(6,182,212,0.6)]" />
+                <span className="text-[11px] uppercase tracking-wider text-cyan-400/80">Sincronizzazione…</span>
               </div>
+            ) : (
+              <TableListMobile
+                tables={tables}
+                onTap={handleTap}
+                isMultiSelected={() => false}
+                courseInfoFor={(id) => tableCourseInfo(id)}
+              />
             )}
           </div>
         </div>
-
-        {/* Colonna Destra: Sidebar Prenotazioni */}
-        <ReservationsSidebar
-          reservations={reservations}
-          selectedReservationId={selectedReservationId}
-          onAddReservation={async (newRes) => {
-            try {
-              const created = await createReservation(newRes);
-              setReservations((prev) => [...prev, created]);
-              setFlash(`📅 Prenotazione creata per ${created.clientName}`);
-            } catch (e) {
-              console.error("Errore creazione prenotazione:", e);
-              setFlash("⚠️ Errore nel salvataggio della prenotazione");
-            }
-          }}
-          onSelectReservation={(res) => {
-            if (selectedReservationId === res.id) {
-              setSelectedReservationId(null);
-            } else {
-              setSelectedReservationId(res.id);
-              setFlash(`🎯 Selezionato ${res.clientName}: tocca un tavolo per assegnarlo`);
-            }
-          }}
-        />
       </main>
 
       <TableModal
@@ -673,7 +349,7 @@ function MappaLive() {
         onClose={() => setSelectedId("")}
         onOpenOrder={(tableId) => {
           const t = allTables.find((item) => item.id === tableId);
-          if (t) setActiveOrderTable({ id: t.id, label: t.label });
+          if (t) setActiveOrderTable({ id: t.id, label: t.label, seats: t.seats });
         }}
         onFlash={setFlash}
         onTableUpdated={reload}
@@ -688,6 +364,7 @@ function MappaLive() {
           <OrderManager
             tableId={activeOrderTable.id}
             tableLabel={activeOrderTable.label}
+            tableSeats={activeOrderTable.seats}
             reservation={linkedReservation ? {
               clientName: linkedReservation.clientName,
               covers: linkedReservation.covers,
@@ -698,6 +375,13 @@ function MappaLive() {
             onFlash={setFlash}
             onTicketClosed={handleTicketClosed}
             onConvertToActive={() => {
+              reload();
+            }}
+            otherTables={allTables
+              .filter((t) => String(t.id) !== activeOrderTable.id)
+              .map((t) => ({ id: String(t.id), label: t.label, status: t.status }))}
+            onOrderMoved={(targetId, targetLabel) => {
+              setActiveOrderTable({ id: targetId, label: targetLabel });
               reload();
             }}
           />
@@ -758,11 +442,6 @@ function MappaLive() {
   );
 }
 
-function labelNum(label: string): number {
-  const n = Number(label.replace(/\D/g, ""));
-  return Number.isFinite(n) ? n : 9999;
-}
-
 function roomPrefixOf(label: string, rooms: PosRoom[]): string {
   const match = rooms
     .map((r) => r.prefix)
@@ -770,10 +449,3 @@ function roomPrefixOf(label: string, rooms: PosRoom[]): string {
     .sort((a, b) => b.length - a.length)[0];
   return match ?? rooms[0].prefix;
 }
-
-/**
- * I tavoli non devono mai sovrapporsi: chi occupa una cella già presa viene
- * spostato nella prima cella libera della sua sala.
- */
-
-

@@ -14,25 +14,37 @@ export interface PosTable {
   span?: number;
 }
 
-/** Griglia logica della mappa: indipendente dalla dimensione dello schermo. */
-export const COLS = 4;
-export const ROWS = 6;
-/** Limiti del lato del tavolo (quadrato) in px. */
-export const MIN_CELL = 52;
-export const MAX_CELL = 116;
+/**
+ * Griglia logica della mappa: rettangolare, pensata per iPad in orizzontale
+ * (schermo da 11 pollici). Meno celle di prima ma più grandi: i tavoli devono
+ * essere ben visibili, non quadratini piccoli.
+ */
+export const COLS = 8;
+export const ROWS = 5;
+/** Limiti del lato del tavolo (quadrato) in px: alzati per restare ben visibili su iPad 11". */
+export const MIN_CELL = 76;
+export const MAX_CELL = 160;
 
 export function tableSpan(table: PosTable): number {
   return Math.max(1, Math.round(table.span ?? 1));
 }
 
-/** Lato di una cella (= lato del tavolo) per un canvas dato. */
+/**
+ * Lato di una cella (= lato del tavolo) per un canvas dato.
+ * Calcola il valore che fa entrare TUTTA la griglia nel canvas (larghezza e altezza
+ * insieme): non forza mai un minimo che sfori il contenitore, altrimenti con
+ * overflow nascosto i tavoli nelle righe/colonne in eccesso spariscono fuori dal
+ * canvas invece di restare visibili (mappa fissa, mai tavoli "persi").
+ */
 export function cellSize(width: number, height: number): number {
   if (!width || !height) return MIN_CELL;
-  const raw = Math.min(width / COLS, height / ROWS);
-  return Math.max(MIN_CELL, Math.min(MAX_CELL, Math.floor(raw)));
+  const byWidth = width / COLS;
+  const byHeight = height / ROWS;
+  const raw = Math.min(byWidth, byHeight);
+  return Math.max(1, Math.min(MAX_CELL, Math.floor(raw)));
 }
 
-const statusStyle: Record<string, { border: string; bg: string; text: string; label: string }> = {
+export const statusStyle: Record<string, { border: string; bg: string; text: string; label: string }> = {
   free: {
     border: "border-2 border-emerald-400/80 shadow-[0_0_18px_rgba(16,185,129,0.25)]",
     bg: "bg-[#0b1f15]/95",
@@ -55,7 +67,7 @@ const statusStyle: Record<string, { border: string; bg: string; text: string; la
     border: "border-2 border-purple-400 shadow-[0_0_22px_rgba(168,85,247,0.45)]",
     bg: "bg-[#120f24]/95",
     text: "text-purple-300",
-    label: "pronto",
+    label: "in attesa",
   },
   occupied: {
     border: "border-2 border-rose-500 shadow-[0_0_20px_rgba(244,63,94,0.35)]",
@@ -80,6 +92,19 @@ interface TableCardProps {
   onMove?: (id: string, col: number, row: number) => void;
   isMultiSelected?: boolean;
   editMode?: boolean;
+  /**
+   * Stato sintetico calcolato dal sistema in base ai piatti serviti (solo quando il tavolo
+   * è "occupied"): sovrascrive lo stile visivo senza toccare lo stato reale del tavolo.
+   */
+  statusOverride?: TableStatus;
+  /** Il tavolo aspetta da troppo tempo (soglia configurabile): mostra un alert visivo pulsante. */
+  alert?: boolean;
+  /**
+   * Chiamato all'inizio effettivo del trascinamento (primo superamento soglia), non al pointerdown:
+   * serve al genitore per sospendere reload/realtime finché il gesto non finisce, altrimenti un
+   * refresh a metà trascinamento fa scattare indietro il tavolo alla posizione precedente.
+   */
+  onDragStart?: () => void;
 }
 
 export const TableCard: React.FC<TableCardProps> = ({
@@ -89,8 +114,12 @@ export const TableCard: React.FC<TableCardProps> = ({
   onMove,
   isMultiSelected,
   editMode,
+  statusOverride,
+  alert,
+  onDragStart,
 }) => {
-  const styleDef = statusStyle[table.status] || statusStyle.free!;
+  const effectiveStatus = statusOverride ?? table.status;
+  const styleDef = statusStyle[effectiveStatus] || statusStyle.free!;
   const span = tableSpan(table);
   const width = cell * span;
   const height = cell;
@@ -133,6 +162,7 @@ export const TableCard: React.FC<TableCardProps> = ({
       const dx = ev.clientX - startX;
       const dy = ev.clientY - startY;
       if (!movedRef.current && Math.abs(dx) < threshold && Math.abs(dy) < threshold) return;
+      if (!movedRef.current) onDragStart?.();
       movedRef.current = true;
       left = Math.min(maxLeft, Math.max(0, baseLeft + dx));
       top = Math.min(maxTop, Math.max(0, baseTop + dy));
@@ -188,8 +218,14 @@ export const TableCard: React.FC<TableCardProps> = ({
         editMode ? "cursor-grab active:cursor-grabbing border-dashed border-cyan-400/80" : "cursor-pointer"
       } ${styleDef.bg} ${styleDef.border} ${
         isMultiSelected ? "ring-4 ring-purple-400 border-purple-400" : ""
-      }`}
+      } ${alert ? "ring-4 ring-red-500 animate-pulse" : ""}`}
     >
+      {alert && (
+        <span className="absolute -left-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.8)]">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400/70" />
+          <span className="relative h-2 w-2 rounded-full bg-white" />
+        </span>
+      )}
       <span className="text-sm font-bold tracking-wide text-slate-100 drop-shadow">{table.label}</span>
       <span className={`text-[10px] font-semibold uppercase tracking-wider ${styleDef.text}`}>
         {styleDef.label}

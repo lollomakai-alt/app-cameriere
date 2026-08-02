@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { supabase } from "@/lib/supabase";
 import { Utensils, Receipt, X, CalendarCheck, Flame, CheckCircle2 } from "lucide-react";
 
-export type TableStatus = "free" | "reserved" | "preparing" | "ready" | "occupied";
+export type TableStatus = "free" | "reserved" | "preparing" | "ready" | "occupied" | "attesa conto";
 
 export interface PosTable {
   id: string;
@@ -124,6 +124,8 @@ export const TableModal: React.FC<TableModalProps> = ({
         return <span className="text-purple-400 font-black uppercase tracking-wider animate-ping">Pronto</span>;
       case "occupied":
         return <span className="text-rose-400 font-black uppercase tracking-wider">Occupato</span>;
+      case "attesa conto":
+        return <span className="text-amber-400 font-black uppercase tracking-wider animate-pulse">Attesa Conto</span>;
     }
   };
 
@@ -136,6 +138,8 @@ export const TableModal: React.FC<TableModalProps> = ({
           ? "border-orange-500/80 shadow-[0_0_90px_rgba(249,115,22,0.35)] ring-1 ring-orange-400/30"
           : table.status === "ready"
           ? "border-purple-500/80 shadow-[0_0_90px_rgba(168,85,247,0.35)] ring-1 ring-purple-400/30"
+          : table.status === "attesa conto"
+          ? "border-amber-500/80 shadow-[0_0_90px_rgba(245,158,11,0.35)] ring-1 ring-amber-400/30"
           : "border-emerald-500/50 shadow-[0_0_90px_rgba(16,185,129,0.3)] ring-1 ring-emerald-400/20"
       }`}>
         
@@ -143,7 +147,7 @@ export const TableModal: React.FC<TableModalProps> = ({
         <div className="flex items-center justify-between border-b border-slate-800 pb-4">
           <div className="flex flex-col gap-1">
             <h3 className={`text-xl sm:text-2xl font-black drop-shadow-[0_0_12px_currentColor] flex items-center gap-2 ${
-              table.status === "reserved" ? "text-cyan-400" : table.status === "preparing" ? "text-orange-400" : table.status === "ready" ? "text-purple-400" : "text-emerald-400"
+              table.status === "reserved" ? "text-cyan-400" : table.status === "preparing" ? "text-orange-400" : table.status === "ready" ? "text-purple-400" : table.status === "attesa conto" ? "text-amber-400" : "text-emerald-400"
             }`}>
               Tavolo <span className="font-mono text-white">{table.label}</span>
             </h3>
@@ -206,7 +210,7 @@ export const TableModal: React.FC<TableModalProps> = ({
               <span>Gestisci Comanda (Cucina)</span>
             </button>
 
-            {(table.status === "occupied" || table.status === "preparing" || table.status === "ready") && (
+            {(table.status === "occupied" || table.status === "preparing" || table.status === "ready" || table.status === "attesa conto") && (
               <button
                 onClick={() => handleUpdateTableInfo("free")}
                 className="w-full rounded-2xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/60 py-4 px-4 text-xs sm:text-sm font-extrabold text-rose-300 shadow-[0_0_25px_rgba(244,63,94,0.3)] hover:shadow-[0_0_35px_rgba(244,63,94,0.5)] hover:border-rose-400 transition-all flex items-center justify-center gap-3 active:scale-95 uppercase tracking-wide min-h-[50px]"

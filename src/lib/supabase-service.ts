@@ -2,6 +2,7 @@ import { supabase } from "@/lib/supabase";
 import type { TableStatus, PosTable } from "@/lib/tables-api";
 import { updateTable } from "@/lib/tables-api";
 import { MenuDish } from "@/lib/menu-data";
+import { insertOrderItems, clearOrderItemsForTable } from "@/lib/order-items-api";
 
 export type PosOrderItem = {
   id: string;
@@ -17,6 +18,8 @@ export type PosTicket = {
   tableLabel?: string;
   items?: PosOrderItem[];
   total?: number;
+  /** Numero di coperti al momento della chiusura: modificabile in ogni momento dal cameriere. */
+  covers?: number;
   [key: string]: any;
 };
 
@@ -27,6 +30,7 @@ export type SupabaseOrderPayload = {
   items: PosOrderItem[];
   subtotal: number;
   total: number;
+  covers?: number;
   destination?: string;
   waiterName?: string;
   timestamp?: string;
@@ -48,6 +52,7 @@ export async function sendOrderToSupabase(payload: SupabaseOrderPayload): Promis
           destination: payload.destination || "Cucina",
           items: payload.items,
           total: payload.total,
+          covers: payload.covers,
           timestamp: timestamp,
         },
       },
@@ -55,16 +60,20 @@ export async function sendOrderToSupabase(payload: SupabaseOrderPayload): Promis
     if (jobErr) console.warn("[Supabase] Avviso print_jobs:", jobErr.message);
 
     if (payload.type === "COMANDA") {
-      const piattiConStato = payload.items.map((item) => ({ ...item, status: item.status || "nuovo" }));
       const { error: comandeErr } = await supabase.from("comande").insert([
         {
           id: randomId,
           tavolo: tableLabel,
           destination: payload.destination || "Cucina",
-          piatti: piattiConStato,
+          piatti: payload.items,
         },
       ]);
       if (comandeErr) console.warn("[Supabase] Avviso comande:", comandeErr.message);
+
+      // Solo i piatti destinati alla Cucina entrano nel flusso di stato ordinato/servito:
+      // il bar/cocktail va dritto al banco e non ha bisogno di essere spuntato dal cameriere.
+      const kitchenItems = payload.items.filter((item) => (item.destination || "Cucina") === "Cucina");
+      await insertOrderItems(payload.tableId, tableLabel, kitchenItems);
     }
 
     const { error: ordiniErr } = await supabase.from("ordini").insert([
@@ -79,7 +88,11 @@ export async function sendOrderToSupabase(payload: SupabaseOrderPayload): Promis
     ]);
     if (ordiniErr) console.warn("[Supabase] Avviso ordini:", ordiniErr.message);
 
-    await updateTableStatusInSupabase(payload.tableId, "occupied");
+    // Il preconto è la richiesta esplicita del conto: il tavolo passa in "attesa conto".
+    // Negli altri casi (comanda inviata) resta semplicemente "occupato": lo stato di
+    // avanzamento del cibo (in preparazione / in attesa portata) è calcolato a parte
+    // dalle righe order_items, senza toccare lo stato manuale del tavolo.
+    await updateTableStatusInSupabase(payload.tableId, payload.type === "PRECONTO" ? "attesa conto" : "occupied");
     return true;
   } catch (err) {
     console.error("[Supabase] Errore salvataggio ordine:", err);
@@ -99,7 +112,21 @@ export async function updateTableStatusInSupabase(tableId: string, status: Table
 
 export async function closeTicketInSupabase(ticket: PosTicket): Promise<boolean> {
   try {
+    const { error: ticketErr } = await supabase.from("tickets").insert([
+      {
+        table_id: ticket.tableId,
+        table_label: ticket.tableLabel || ticket.tableId,
+        items: ticket.items || [],
+        total: ticket.total || 0,
+        covers: ticket.covers ?? null,
+        status: "closed",
+        closed_at: new Date().toISOString(),
+      },
+    ]);
+    if (ticketErr) throw ticketErr;
+
     await updateTableStatusInSupabase(ticket.tableId, "free");
+    await clearOrderItemsForTable(ticket.tableId);
     return true;
   } catch (err) {
     console.error("[Supabase] Errore chiusura conto:", err);
@@ -118,7 +145,7 @@ export async function fetchMenuDishesFromSupabase(): Promise<MenuDish[] | null> 
       console.error("[Supabase] Errore recupero menu_dishes:", error.message);
       return null;
     }
-    return (data || []).map((row: any) => ({
+    const dishes = (data || []).map((row: any) => ({
       id: String(row.id),
       name: row.name,
       description: row.description || "",
@@ -130,6 +157,18 @@ export async function fetchMenuDishesFromSupabase(): Promise<MenuDish[] | null> 
       course: row.course || undefined,
       isQuickItem: Boolean(row.is_quick_item),
     }));
+
+    // Rimuove i piatti doppi: stesso nome scritto esattamente uguale (spazi iniziali/finali ignorati).
+    // Tiene il primo incontrato, così eventuali righe duplicate su Supabase non vengono più mostrate.
+    const seenNames = new Set<string>();
+    const deduped = dishes.filter((dish) => {
+      const key = dish.name.trim().toLowerCase();
+      if (seenNames.has(key)) return false;
+      seenNames.add(key);
+      return true;
+    });
+
+    return deduped;
   } catch (err) {
     console.error("[Supabase] Errore fetch menu:", err);
     return null;
@@ -177,6 +216,30 @@ export async function deleteDishFromSupabase(dishId: string): Promise<boolean> {
   }
 }
 
-export async function reopenTicketInSupabase(ticket: PosTicket): Promise<boolean> {
-  return true;
+export async function reopenTicketInSupabase(ticket: PosTicket & { id?: string }): Promise<boolean> {
+  try {
+    if (ticket.id) {
+      const { error } = await supabase.from("tickets").update({ status: "reopened" }).eq("id", ticket.id);
+      if (error) throw error;
+    }
+
+    await updateTableStatusInSupabase(ticket.tableId, "occupied");
+
+    // Ripristina il conto nel draft locale del tavolo, così il cameriere ritrova gli articoli e può continuare a modificarlo
+    if (typeof window !== "undefined" && ticket.tableId) {
+      try {
+        window.localStorage.setItem(
+          `draft:table:${ticket.tableId}`,
+          JSON.stringify({ orderItems: ticket.items || [], discountPercent: 0, splitCount: 1 }),
+        );
+      } catch {
+        // storage non disponibile: la riapertura su Supabase resta comunque valida
+      }
+    }
+
+    return true;
+  } catch (err) {
+    console.error("[Supabase] Errore riapertura conto:", err);
+    return false;
+  }
 }

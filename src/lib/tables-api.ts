@@ -10,7 +10,7 @@ export const COL_LABEL = `${WJ}table_number`;
 export const COL_X = `position_x${WJ}`;
 export const COL_Y = `position_y${WJ}`;
 
-export type TableStatus = "free" | "reserved" | "preparing" | "ready" | "occupied";
+export type TableStatus = "free" | "reserved" | "preparing" | "ready" | "occupied" | "attesa conto";
 
 export interface PosTable {
   id: string;
@@ -47,18 +47,16 @@ function normalizeStatus(raw: unknown): TableStatus {
   if (s === "reserved" || s === "riservato") return "reserved";
   if (s === "preparing" || s === "in_preparazione") return "preparing";
   if (s === "ready" || s === "pronto") return "ready";
+  if (s === "attesa conto" || s === "attesa_conto") return "attesa conto";
   return "free";
 }
 
-/**
- * Griglia logica: le posizioni sono colonna/riga, non percentuali dello schermo.
- * IMPORTANTE: deve restare identica a COLS/ROWS in TableCard.tsx. Se questi due
- * valori divergono, ogni posizione con colonna/riga oltre il vecchio limite viene
- * scambiata per una "percentuale legacy" e riportata quasi a zero al primo reload
- * (è esattamente il bug per cui i tavoli tornavano vicino alla prima cella).
+/** Griglia logica: le posizioni sono colonna/riga, non percentuali dello schermo.
+ * Deve restare identica a COLS/ROWS in TableCard.tsx (canvas rettangolare per iPad orizzontale),
+ * altrimenti i tavoli vengono posizionati/clampati su una griglia diversa da quella disegnata.
  */
 export const GRID_COLS = 8;
-export const GRID_ROWS = 12;
+export const GRID_ROWS = 5;
 
 export function gridPosition(index: number) {
   return { x: index % GRID_COLS, y: Math.floor(index / GRID_COLS) % GRID_ROWS };
@@ -86,7 +84,7 @@ function mapRow(row: Record<string, any>, index: number, spans: Record<string, n
     x: toCell(row[COL_X], fallback.x, GRID_COLS),
     y: toCell(row[COL_Y], fallback.y, GRID_ROWS),
 
-    seats: Number(row.seats ?? 4),
+    seats: Number(row.seats ?? 2),
     span: spans[id] ?? 1,
   };
 }
@@ -109,7 +107,7 @@ export async function createTable(label: string, index: number): Promise<PosTabl
         status: "free",
         [COL_X]: pos.x,
         [COL_Y]: pos.y,
-        seats: 4,
+        seats: 2,
       },
     ])
     .select()
